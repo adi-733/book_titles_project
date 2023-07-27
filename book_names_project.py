@@ -11,6 +11,42 @@ import requests
 LETTERS = re.compile("[^a-zA-Z \n*]")
 
 
+def get_proofs():
+    conn = get_conn()
+    for _, book in (
+        conn.execute(
+            """SELECT * from late_appearing_titles 
+            where link not in (select link from first_appearance_proof)"""
+        )
+        .fetchdf()
+        .iterrows()
+    ):
+        if book.project == "usa":
+            website_format = "pg"
+        elif book.project == "canada":
+            website_format = "pg_ca"
+        elif book.project == "australia":
+            website_format = "pg_aus"
+        else:
+            raise Exception("unknown project")
+        proof = read_one_book(book, website_format, return_proof=True)
+        if proof:
+            try:
+                conn.execute(
+                    f"""INSERT INTO first_appearance_proof
+            (project, link, proof)
+            VALUES ('{book.project}','{book.link}','{proof.strip().replace("'", "''")}') 
+            """
+                )
+            except duckdb.ConstraintException:
+                pass
+            except:
+                print(f"error in {book.link}")
+        else:
+            print(f"no proof for {book.title}")
+
+
+
 def scrape_goodreads(title, author):
     search_phrase = "+".join(title.split() + author.split())
     res = requests.get(
@@ -43,17 +79,28 @@ def book_genres_aus_ca():
     conn = get_conn()
     for _, book in (
         conn.execute(
-            """SELECT title, author FROM pg_books_ca
-            /*  where subjects is null */"""
+            """SELECT link, project, title, author FROM late_appearing_titles
+              where subjects is null """
         )
         .fetchdf()
         .iterrows()
     ):
-        try:
-            genres, year = scrape_goodreads(book.title, LETTERS.sub("", book.author))
-            print(book.title, book.author, genres, year)
-        except:
-            print(f"not found for {book.title}")
+        author = LETTERS.sub("", book.author)
+        title = LETTERS.split(book.title)[0]
+        table = "pg_books_aus" if book.project == "australia" else "pg_books_ca"
+        for word in author.split():
+            try:
+                genres, year = scrape_goodreads(title, word)
+                if genres:
+                    conn.execute(
+                        f"""update {table}
+                    set subjects={genres}, year={year}
+                    where link='{book.link}'
+                    """
+                    )
+                    break
+            except:
+                print(f"not found for {book.title}")
 
 
 def book_subjects_pg():
@@ -145,21 +192,25 @@ def get_start_and_end_lines(website_format, text_lines):
         return start_line, end_line
 
 
-def read_one_book(book, website_format):
+def read_one_book(book, website_format, return_proof=False):
     res = requests.get(book.link)
     if not res.ok:
         raise Exception(f"Error reading book utf, {book.title}")
     all_text = LETTERS.sub("", res.text)
     text_lines = all_text.lower().split("\n")
     text_lines = [i for i in text_lines if i]
-    start_line, end_line = get_start_and_end_lines(
-        website_format=website_format, text_lines=text_lines
-    )
+    try:
+        start_line, end_line = get_start_and_end_lines(
+            website_format=website_format, text_lines=text_lines
+        )
+    except:
+        raise Exception("No start and finish line found")
     text_lines = text_lines[
         text_lines.index(start_line) + 1 : text_lines.index(end_line) - 1
     ]
     book.length = len(text_lines)
-    title_appearences = re.compile(f".*{book.title.lower()}.*").findall(
+
+    title_appearences = re.compile(f".*{LETTERS.sub('',book.title.lower())}.*").findall(
         "\n".join(text_lines)
     )
     title_appearences = [
@@ -173,14 +224,35 @@ def read_one_book(book, website_format):
         i / book.length for i in book.title_appearences_locs
     ]
     book.title_appearences_count = len(title_appearences)
-    return book
+    if not return_proof:
+        return book
+    try:
+        real_app = res.text.splitlines()[
+            LETTERS.sub("", res.text).lower().splitlines().index(title_appearences[0])
+        ]
+        # if "." in real_app:
+        #     real_app = [part for part in real_app.split(".") if book.title.lower().strip() in part.lower()][0]
+        index_in_text = res.text.replace("\r\n", " ").index(real_app)
+        text_to_search = res.text.replace("\r\n", " ")[
+            index_in_text - 500 : index_in_text + 1000
+        ]
+        return [phrase for phrase in text_to_search.split(".") if real_app in phrase][0]
+    except IndexError:
+        index_in_text = res.text.replace("\r\n", " ").index(real_app)
+        text_to_search = res.text.replace("\r\n", " ")[
+            index_in_text - 100 : index_in_text + 100
+        ]
+        return text_to_search
+    except re.error:
+        print(f"error in book name regex, {book.title}")
 
 
 def read_books(table, website_format):
+    count_changed = 0
     conn = get_conn()
     for _, book in (
         conn.execute(
-            f"SELECT id, link, title FROM {table} WHERE length IS NULL AND FAILED IS NULL"
+            f"SELECT id, link, title, title_appearences_count FROM {table} WHERE length is null and failed is null"
         )
         .fetchdf()
         .iterrows()
@@ -189,11 +261,12 @@ def read_books(table, website_format):
             book = read_one_book(book, website_format=website_format)
             conn.execute(
                 f"""UPDATE {table}
-             SET length={book.length},
-                 title_appearences_locs={book.title_appearences_locs},
-                 title_appearences_relative={book.title_appearences_relative},
-                 title_appearences_count={book.title_appearences_count} 
-                 WHERE id={book.id}"""
+                     SET length={book.length},
+                     title_appearences_locs={book.title_appearences_locs},
+                     title_appearences_relative={book.title_appearences_relative},
+                     title_appearences_count={book.title_appearences_count},
+                     failed=null 
+                     WHERE id={book.id}"""
             )
         except Exception as e:
             if "Error reading book utf" in repr(e):
@@ -207,21 +280,22 @@ def read_books(table, website_format):
 def clean_pg_books():
     conn = get_conn()
     for _, book in (
-        conn.execute("select * from pg_books where title like '%:%'")
+        conn.execute("select * from pg_books where title like '%\n%'")
         .fetchdf()
         .iterrows()
     ):
+        new_title = book.title.split("\n")[0].replace("'", "''").strip()
         conn.execute(
             f"""UPDATE pg_books
                      SET length=NULL,
-                     title='{book.title.split(":")[0].replace("'","''")}'
+                     title='{new_title}'
                          WHERE id={book.id}"""
         )
 
 
 def book_genres_csv():
     df = pd.read_csv(
-        "/Users/adiraz/Desktop/datasets for book project/books_and_genres.csv"
+        "books_and_genres.csv"
     )  # this csv is from https://www.kaggle.com/datasets/michaelrussell4/10000-books-and-their-genres-standardized?resource=download
     df = df[["title", "genres"]]
     conn = get_conn()
@@ -234,7 +308,7 @@ def book_genres_csv():
 
 def book_genres_goodreads_csv():
     df = pd.read_csv(
-        "/Users/adiraz/Desktop/datasets for book project/goodreads_data.csv"
+        "goodreads_data.csv"
     )  # this csv is from https://www.kaggle.com/datasets/ishikajohari/best-books-10k-multi-genre-data
     df = df[["Book", "Genres"]]
     conn = get_conn()
@@ -249,7 +323,7 @@ def book_genres_goodreads_csv():
             pass
 
 
-def project_gutenberg_aus_metadata():
+def pg_aus_metadata():
     conn = get_conn()
     res = requests.get("http://www.gutenberg.net.au/catalogue.txt")
     if not res.ok:
@@ -276,7 +350,7 @@ def project_gutenberg_aus_metadata():
             print(f"failed in line {line}, error {e}")
 
 
-def project_gutenberg_ca_metadata():
+def pg_ca_metadata():
     conn = get_conn()
     catalog = "http://gutenberg.ca/index.html#h2completecatalogue"
     res = requests.get(catalog)
@@ -359,9 +433,58 @@ def standardebooks_metadata():
             print(f"error in https://standardebooks.org/{book}")
 
 
+def fadedpage_metadata():
+    conn = get_conn()
+    res = requests.get("https://www.fadedpage.com/allbooks.php")
+    tree = lxml.html.fromstring(res.text)
+    ranges = [
+        i.get("href") for i in tree.xpath("//a[contains(@href, '/allbooks.php?range')]")
+    ]
+    for range in ranges:
+        res = requests.get(f"https://www.fadedpage.com{range}")
+        tree = lxml.html.fromstring(res.text)
+        books = tree.xpath("//tr")
+        for book in books:
+            author = book.xpath("td")[0].xpath("a/text()")[0]
+            title = book.xpath("td")[1].xpath("a/text()")[0]
+            year = book.xpath("td/text()")[0]
+            link = f'https://www.fadedpage.com{book.xpath("td")[1].xpath("a")[0].get("href")}'
+            book_res = requests.get(link)
+            book_tree = lxml.html.fromstring(book_res.text)
+            tags = [
+                tag
+                for tag in book_tree.xpath("//a[contains(@href, 'tags=')]/text()")
+                if "'" not in tag
+            ]
+            id = link.split("=")[-1]
+            try:
+                conn.execute(
+                    f"""INSERT INTO fadedpage
+                                    (id, link, title, author, year, tags)
+                                    VALUES ('{id}',
+                                    '{link}', '{title.replace("'", "''")}',
+                                    '{author.replace("'", "''")}',{year}, {tags})"""
+                )
+            except duckdb.ConstraintException:
+                pass
+            except:
+                print(f"error while inserting {link}")
+
+
 def get_conn():
     return duckdb.connect(database="books.duckdb", read_only=False)
 
 
 if __name__ == "__main__":
-    pass
+    fadedpage_metadata()
+    standardebooks_metadata()
+    pg_books_metadata()
+    clean_pg_books()
+    book_subjects_pg()
+    pg_ca_metadata()
+    pg_aus_metadata()
+    read_books(table="pg_books", website_format="pg")
+    read_books(table="pg_books_ca", website_format="pg_ca")
+    read_books(table="pg_books_aus", website_format="pg_aus")
+    book_genres_aus_ca()
+    get_proofs()

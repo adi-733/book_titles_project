@@ -132,7 +132,7 @@ def book_subjects_pg():
 def pg_books_metadata():
     conn = get_conn()
     reader = csv.reader(
-        open("/Users/adiraz/Downloads/pg_catalog.csv")
+        open("pg_catalog.csv")
     )  # gutenberg us catalog: https://www.gutenberg.org/cache/epub/feeds/pg_catalog.csv
     headers = next(reader)
     headers = {i: headers.index(i) for i in headers}
@@ -280,11 +280,12 @@ def read_books(table, website_format):
 def clean_pg_books():
     conn = get_conn()
     for _, book in (
-        conn.execute("select * from pg_books where title like '%\n%'")
+        conn.execute("select * from pg_books where title like '%\n%' or title like '%:%")
         .fetchdf()
         .iterrows()
     ):
         new_title = book.title.split("\n")[0].replace("'", "''").strip()
+        new_title = new_title.split(":")[0].replace("'", "''").strip()
         conn.execute(
             f"""UPDATE pg_books
                      SET length=NULL,
